@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# Model files
+models/*.pth
+models/*.onnx
+models/*.rknn
+models/*.tflite
+
+# Training reports
+models/report_*.md
+
+# Data
+rawdata/
+data/
+
+# Environment
+.env
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
