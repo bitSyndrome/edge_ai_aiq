@@ -104,8 +104,47 @@ class SensorWindowDataset(Dataset):
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
 
-def create_datasets(rawdata_dir, window_size=30, val_ratio=0.2):
-    """CSV 로드 -> 전처리 -> 학습/검증 데이터셋 생성."""
+class PredictiveDataset(Dataset):
+    """예지보전용 데이터셋. 과거 window_size개 샘플로 horizon 스텝 후의 등급을 예측."""
+
+    def __init__(self, features, labels, window_size=30, horizon=300):
+        self.features = features
+        self.labels = labels
+        self.window_size = window_size
+        self.horizon = horizon
+
+    def __len__(self):
+        return len(self.features) - self.window_size - self.horizon
+
+    def __getitem__(self, idx):
+        x = self.features[idx : idx + self.window_size]
+        y = self.labels[idx + self.window_size + self.horizon]
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
+
+
+class AnomalyDataset(Dataset):
+    """이상 탐지용 비지도 학습 데이터셋. 입력 = 타겟 (복원 학습)."""
+
+    def __init__(self, features, window_size=30):
+        self.features = features
+        self.window_size = window_size
+
+    def __len__(self):
+        return len(self.features) - self.window_size
+
+    def __getitem__(self, idx):
+        x = self.features[idx : idx + self.window_size]
+        x = torch.tensor(x, dtype=torch.float32)
+        return x, x
+
+
+def create_datasets(rawdata_dir, window_size=30, val_ratio=0.2, task="classify", horizon=300):
+    """CSV 로드 -> 전처리 -> 학습/검증 데이터셋 생성.
+
+    Args:
+        task: "classify" (현재 등급), "forecast" (미래 등급 예측), "anomaly" (이상 탐지)
+        horizon: forecast 태스크에서 예측할 미래 스텝 수 (기본 300 = 5분)
+    """
     print("[1/3] Loading CSV files...")
     df = load_csv_files(rawdata_dir)
 
@@ -115,19 +154,37 @@ def create_datasets(rawdata_dir, window_size=30, val_ratio=0.2):
     features = df[FEATURE_COLS].values  # (N, 5)
     labels = df["label"].values         # (N,)
 
-    # 라벨 분포 출력
-    unique, counts = np.unique(labels, return_counts=True)
-    for u, c in zip(unique, counts):
-        label_name = {0: "Good", 1: "Normal", 2: "Bad", 3: "Very Bad"}[u]
-        print(f"    Label {u} ({label_name}): {c} ({c/len(labels)*100:.1f}%)")
+    # 라벨 분포 출력 (anomaly 제외)
+    if task != "anomaly":
+        unique, counts = np.unique(labels, return_counts=True)
+        for u, c in zip(unique, counts):
+            label_name = {0: "Good", 1: "Normal", 2: "Bad", 3: "Very Bad"}[u]
+            print(f"    Label {u} ({label_name}): {c} ({c/len(labels)*100:.1f}%)")
 
     # 시계열이므로 앞부분을 학습, 뒷부분을 검증으로 분할
-    print("[3/3] Creating datasets...")
-    total = len(features) - window_size
-    split = int(total * (1 - val_ratio))
+    print(f"[3/3] Creating datasets (task={task})...")
 
-    train_ds = SensorWindowDataset(features[:split + window_size], labels[:split + window_size], window_size)
-    val_ds = SensorWindowDataset(features[split:], labels[split:], window_size)
+    if task == "classify":
+        total = len(features) - window_size
+        split = int(total * (1 - val_ratio))
+        train_ds = SensorWindowDataset(features[:split + window_size], labels[:split + window_size], window_size)
+        val_ds = SensorWindowDataset(features[split:], labels[split:], window_size)
+
+    elif task == "forecast":
+        total = len(features) - window_size - horizon
+        split = int(total * (1 - val_ratio))
+        train_ds = PredictiveDataset(features[:split + window_size + horizon],
+                                     labels[:split + window_size + horizon], window_size, horizon)
+        val_ds = PredictiveDataset(features[split:], labels[split:], window_size, horizon)
+
+    elif task == "anomaly":
+        total = len(features) - window_size
+        split = int(total * (1 - val_ratio))
+        train_ds = AnomalyDataset(features[:split + window_size], window_size)
+        val_ds = AnomalyDataset(features[split:], window_size)
+
+    else:
+        raise ValueError(f"Unknown task: {task}")
 
     print(f"    Train: {len(train_ds)}, Val: {len(val_ds)}")
     return train_ds, val_ds

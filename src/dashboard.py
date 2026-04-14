@@ -168,12 +168,20 @@ def page_data():
 
 # ─── 실시간 추론 탭 ───
 
+def is_anomaly_model(model_name):
+    return "anomaly" in model_name.lower()
+
+
 def page_inference():
     st.subheader("실시간 공기질 추론")
 
     selected_model = st.session_state.get("selected_onnx")
     if not selected_model:
         st.error("models/ 폴더에 ONNX 모델이 없습니다. 먼저 학습 및 ONNX 변환을 실행하세요.")
+        return
+
+    if is_anomaly_model(selected_model):
+        st.warning("현재 선택된 모델은 이상 탐지(anomaly) 모델입니다. 분류 모델을 선택하거나 '⚠️ 이상 탐지' 탭을 이용하세요.")
         return
 
     model_path = os.path.join(MODELS_DIR, selected_model)
@@ -412,6 +420,226 @@ def page_model_graph():
             st.text(f"[{i}] {node.op_type}: {inputs} → {outputs}")
 
 
+# ─── 공기질 예측 탭 ───
+
+def page_forecast():
+    st.subheader("공기질 악화 예측 (5분 후)")
+
+    # forecast 모델 선택
+    onnx_files = sorted(glob.glob(os.path.join(MODELS_DIR, "*forecast*.onnx")))
+    if not onnx_files:
+        st.warning("forecast 모델이 없습니다. 먼저 `--task forecast`로 학습 후 ONNX 변환하세요.")
+        st.code("python src/train.py --task forecast --horizon 300\nbash run_export_onnx.sh", language="bash")
+        return
+
+    onnx_names = [os.path.basename(f) for f in onnx_files]
+    selected_forecast = st.selectbox("Forecast 모델 선택", onnx_names, key="forecast_model")
+    model_path = os.path.join(MODELS_DIR, selected_forecast)
+    sess = load_onnx_model(model_path)
+
+    input_shape = sess.get_inputs()[0].shape
+    window_size = input_shape[1]
+
+    # CSV 데이터 로드
+    csv_files = sorted(glob.glob(os.path.join(RAWDATA_DIR, "*.csv")))
+    if not csv_files:
+        st.error("rawdata 폴더에 CSV 파일이 없습니다.")
+        return
+
+    filenames = [os.path.basename(f) for f in csv_files]
+    selected_csv = st.selectbox("CSV 파일 선택", filenames, key="forecast_csv")
+    df = load_csv(os.path.join(RAWDATA_DIR, selected_csv))
+
+    horizon = 300
+    st.info(f"윈도우: {window_size}샘플 | 예측 시점: {horizon}스텝(5분) 후 공기질 등급")
+
+    if len(df) < window_size + horizon:
+        st.error(f"데이터가 부족합니다. 최소 {window_size + horizon}개 필요 (현재: {len(df)}개)")
+        return
+
+    # 정규화
+    norm_features = []
+    for col in SENSOR_COLS:
+        vmin, vmax = FEATURE_RANGES[col]
+        norm_features.append(((df[col] - vmin) / (vmax - vmin)).clip(0, 1).values)
+    features = np.column_stack(norm_features)
+
+    # 슬라이딩 윈도우 추론
+    input_name = sess.get_inputs()[0].name
+    predictions = []
+    actual_labels = []
+    timestamps = []
+
+    step = max(1, (len(df) - window_size - horizon) // 500)  # 최대 500개 포인트
+    for i in range(0, len(df) - window_size - horizon, step):
+        x = features[i : i + window_size][np.newaxis].astype(np.float32)
+        output = sess.run(None, {input_name: x})[0]
+        pred = int(np.argmax(output[0]))
+        predictions.append(pred)
+        actual_labels.append(int(df["label"].iloc[i + window_size + horizon]))
+        timestamps.append(df["timestamp"].iloc[i + window_size])
+
+    result_df = pd.DataFrame({
+        "timestamp": timestamps,
+        "실제 등급 (5분 후)": actual_labels,
+        "예측 등급": predictions,
+    })
+
+    # 정확도
+    correct = sum(1 for a, p in zip(actual_labels, predictions) if a == p)
+    accuracy = correct / len(predictions) * 100
+
+    col_acc, col_cnt = st.columns(2)
+    col_acc.metric("예측 정확도", f"{accuracy:.1f}%")
+    col_cnt.metric("평가 샘플 수", f"{len(predictions):,}")
+
+    # 시계열 비교 차트
+    st.markdown("### 실제 vs 예측 등급")
+    chart_df = result_df.set_index("timestamp")
+    st.line_chart(chart_df, height=300)
+
+    # 혼동행렬
+    st.markdown("### 혼동행렬")
+    num_classes = 4
+    conf_matrix = np.zeros((num_classes, num_classes), dtype=int)
+    for a, p in zip(actual_labels, predictions):
+        if a < num_classes and p < num_classes:
+            conf_matrix[a][p] += 1
+
+    conf_df = pd.DataFrame(
+        conf_matrix,
+        index=[f"실제: {LABEL_NAMES[i]}" for i in range(num_classes)],
+        columns=[f"예측: {LABEL_NAMES[i]}" for i in range(num_classes)],
+    )
+    st.dataframe(conf_df, use_container_width=True)
+
+    # 등급별 정확도
+    st.markdown("### 등급별 정확도")
+    class_cols = st.columns(num_classes)
+    for c in range(num_classes):
+        total_c = conf_matrix[c].sum()
+        correct_c = conf_matrix[c][c]
+        acc_c = correct_c / total_c * 100 if total_c > 0 else 0
+        class_cols[c].metric(
+            LABEL_NAMES[c],
+            f"{acc_c:.1f}%",
+            f"{correct_c}/{total_c}",
+        )
+
+
+# ─── 이상 탐지 탭 ───
+
+def page_anomaly():
+    st.subheader("센서 이상 탐지 (Autoencoder)")
+
+    # anomaly 모델 선택
+    onnx_files = sorted(glob.glob(os.path.join(MODELS_DIR, "*anomaly*.onnx")))
+    if not onnx_files:
+        st.warning("anomaly 모델이 없습니다. 먼저 `--task anomaly`로 학습 후 ONNX 변환하세요.")
+        st.code("python src/train.py --task anomaly --model AirQualityAutoencoder\nbash run_export_onnx.sh", language="bash")
+        return
+
+    onnx_names = [os.path.basename(f) for f in onnx_files]
+    selected_anomaly = st.selectbox("Anomaly 모델 선택", onnx_names, key="anomaly_model")
+    model_path = os.path.join(MODELS_DIR, selected_anomaly)
+    sess = load_onnx_model(model_path)
+
+    input_shape = sess.get_inputs()[0].shape
+    window_size = input_shape[1]
+
+    # CSV 데이터 로드
+    csv_files = sorted(glob.glob(os.path.join(RAWDATA_DIR, "*.csv")))
+    if not csv_files:
+        st.error("rawdata 폴더에 CSV 파일이 없습니다.")
+        return
+
+    filenames = [os.path.basename(f) for f in csv_files]
+    selected_csv = st.selectbox("CSV 파일 선택", filenames, key="anomaly_csv")
+    df = load_csv(os.path.join(RAWDATA_DIR, selected_csv))
+
+    # 임계값 설정
+    threshold = st.slider("이상 판정 임계값 (MSE)", 0.001, 0.2, 0.05, 0.001,
+                           help="복원 오차가 이 값을 초과하면 이상으로 판정합니다.")
+
+    if len(df) < window_size:
+        st.error(f"데이터가 부족합니다. 최소 {window_size}개 필요")
+        return
+
+    # 정규화
+    norm_features = []
+    for col in SENSOR_COLS:
+        vmin, vmax = FEATURE_RANGES[col]
+        norm_features.append(((df[col] - vmin) / (vmax - vmin)).clip(0, 1).values)
+    features = np.column_stack(norm_features)
+
+    # 슬라이딩 윈도우 추론
+    input_name = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+    mse_list = []
+    sensor_mse_list = []
+    timestamps = []
+
+    step = max(1, (len(df) - window_size) // 500)
+    for i in range(0, len(df) - window_size, step):
+        x = features[i : i + window_size][np.newaxis].astype(np.float32)
+        recon = sess.run(None, {input_name: x})[0]
+        # 전체 MSE
+        mse = float(np.mean((x - recon) ** 2))
+        mse_list.append(mse)
+        # 센서별 MSE
+        sensor_mse = np.mean((x[0] - recon[0]) ** 2, axis=0)  # (num_features,)
+        sensor_mse_list.append(sensor_mse)
+        timestamps.append(df["timestamp"].iloc[i + window_size])
+
+    mse_arr = np.array(mse_list)
+    sensor_mse_arr = np.array(sensor_mse_list)  # (N, 5)
+    is_anomaly = mse_arr > threshold
+    anomaly_count = int(is_anomaly.sum())
+    anomaly_ratio = anomaly_count / len(mse_arr) * 100
+
+    # 요약 메트릭
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("평가 구간", f"{len(mse_arr):,}")
+    col2.metric("이상 감지", f"{anomaly_count:,}")
+    col3.metric("이상 비율", f"{anomaly_ratio:.1f}%")
+    col4.metric("평균 MSE", f"{mse_arr.mean():.6f}")
+
+    # 전체 복원 오차 차트
+    st.markdown("### 복원 오차 (전체)")
+    error_df = pd.DataFrame({
+        "timestamp": timestamps,
+        "복원 오차 (MSE)": mse_list,
+        "임계값": [threshold] * len(timestamps),
+    }).set_index("timestamp")
+    st.line_chart(error_df, height=250)
+
+    # 이상 구간 표시
+    if anomaly_count > 0:
+        st.markdown(f"### 이상 감지 구간 ({anomaly_count}건)")
+        anomaly_times = [timestamps[i] for i in range(len(timestamps)) if is_anomaly[i]]
+        anomaly_mses = [mse_list[i] for i in range(len(mse_list)) if is_anomaly[i]]
+        anomaly_df = pd.DataFrame({
+            "시각": anomaly_times,
+            "MSE": anomaly_mses,
+        })
+        st.dataframe(anomaly_df.style.format({"MSE": "{:.6f}"}),
+                      use_container_width=True, height=min(300, 35 * anomaly_count + 38))
+
+    # 센서별 복원 오차
+    st.markdown("### 센서별 복원 오차")
+    sensor_error_df = pd.DataFrame(sensor_mse_arr, columns=[s["name"] for s in SENSORS])
+    sensor_error_df["timestamp"] = timestamps
+    sensor_error_df = sensor_error_df.set_index("timestamp")
+    st.line_chart(sensor_error_df, height=300)
+
+    # 센서별 평균 오차
+    st.markdown("### 센서별 평균 복원 오차")
+    avg_cols = st.columns(5)
+    avg_mse = sensor_mse_arr.mean(axis=0)
+    for i, sensor in enumerate(SENSORS):
+        avg_cols[i].metric(sensor["name"], f"{avg_mse[i]:.6f}")
+
+
 # ─── main ───
 
 def main():
@@ -424,15 +652,22 @@ def main():
         selected = st.sidebar.selectbox("ONNX 모델 선택", onnx_names, index=len(onnx_names) - 1)
         st.session_state["selected_onnx"] = selected
 
-    tab_data, tab_inference, tab_viewer, tab_graph = st.tabs(
-        ["📊 데이터 분석", "🤖 실시간 추론", "🔍 모델 구조 (Netron)", "📐 모델 구조 (Graphviz)"]
-    )
+    tab_data, tab_inference, tab_forecast, tab_anomaly, tab_viewer, tab_graph = st.tabs([
+        "📊 데이터 분석", "🤖 실시간 추론", "🔮 공기질 예측",
+        "⚠️ 이상 탐지", "🔍 모델 구조 (Netron)", "📐 모델 구조 (Graphviz)",
+    ])
 
     with tab_data:
         page_data()
 
     with tab_inference:
         page_inference()
+
+    with tab_forecast:
+        page_forecast()
+
+    with tab_anomaly:
+        page_anomaly()
 
     with tab_viewer:
         page_model_viewer()

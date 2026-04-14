@@ -62,3 +62,38 @@ class AirQualityMLP(nn.Module):
         # x: (batch, window, features) -> (batch, window * features)
         x = x.reshape(x.size(0), -1)
         return self.net(x)
+
+
+@register_model
+class AirQualityAutoencoder(nn.Module):
+    """센서 이상 탐지용 1D-CNN Autoencoder.
+
+    Input:  (batch, window_size, num_features)  e.g. (B, 30, 5)
+    Output: (batch, window_size, num_features)  e.g. (B, 30, 5)  — 복원된 입력
+    """
+
+    def __init__(self, num_features=5, window_size=30, **kwargs):
+        super().__init__()
+        self.window_size = window_size
+        # 30 -> AvgPool(k=3,s=3) -> 10 (ONNX 호환)
+        self.encoder = nn.Sequential(
+            nn.Conv1d(num_features, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(32, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AvgPool1d(kernel_size=3, stride=3),
+        )
+        # 10 -> Upsample -> 30
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose1d(16, 32, kernel_size=3, stride=3),
+            nn.ReLU(),
+            nn.Conv1d(32, num_features, kernel_size=3, padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # x: (batch, window, features) -> (batch, features, window) for Conv1d
+        x = x.permute(0, 2, 1)
+        z = self.encoder(x)            # (batch, 16, 10)
+        recon = self.decoder(z)         # (batch, features, window)
+        return recon.permute(0, 2, 1)   # (batch, window, features)

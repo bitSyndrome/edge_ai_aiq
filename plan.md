@@ -24,6 +24,18 @@ RV1106 NPU 가속에 최적화된 모델을 생성하는 단계입니다.
 * [*] **모델 구조 시각화:** Netron(iframe) 및 Graphviz(네이티브) 두 가지 방식 대시보드 통합. 독립 뷰어도 지원. (`src/view_model.py`, `src/dashboard.py`)
 * [*] **대시보드:** 데이터 분석, 실시간 추론, 모델 구조 시각화(Netron/Graphviz) 4개 탭. 사이드바에서 ONNX 모델 선택 공유. (`src/dashboard.py`)
 
+### 2-1단계: 예지보전 기능 (Predictive Maintenance)
+공기질 악화 예측 및 센서 이상 탐지 기능을 추가하는 단계입니다.
+* [*] **공기질 예측 데이터셋:** PredictiveDataset 구현 — 과거 30샘플로 5분(300스텝) 후 등급 예측. (`src/dataset.py`)
+* [*] **이상 탐지 데이터셋:** AnomalyDataset 구현 — 비지도 학습용 입력=타겟 복원 데이터셋. (`src/dataset.py`)
+* [*] **Autoencoder 모델:** AirQualityAutoencoder 1D-CNN 기반 Encoder-Decoder. (`src/model.py`)
+* [*] **학습 파이프라인 확장:** `--task {classify,forecast,anomaly}` 및 `--horizon` 인자 추가. (`src/train.py`)
+* [*] **ONNX 변환 확장:** anomaly 모델 출력(reconstructed) 지원. (`src/export_onnx.py`)
+* [*] **대시보드 예측 탭:** CSV 데이터로 5분 후 등급 예측, 실제 vs 예측 비교, 혼동행렬. (`src/dashboard.py`)
+* [*] **대시보드 이상 탐지 탭:** 복원 오차 시계열, 임계값 조절, 센서별 오차 분석. (`src/dashboard.py`)
+* [ ] **예측 모델 학습:** forecast 태스크로 모델 학습 및 ONNX 변환
+* [ ] **이상 탐지 모델 학습:** anomaly 태스크로 Autoencoder 학습 및 ONNX 변환
+
 ### 3단계: RKNN 변환 및 최적화 (Model Conversion)
 PC(Ubuntu)의 RKNN-Toolkit2를 사용하여 보드 전용 모델을 만듭니다.
 * [ ] **RKNN-Toolkit2 환경 구축:** Docker 또는 가상환경에 변환 툴킷 설치.
